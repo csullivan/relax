@@ -222,6 +222,38 @@ class TestConv2d(Conv2dBase):
         )
         tvm.testing.assert_allclose(out.numpy(), ref, atol=1e-4, rtol=1e-4)
 
+    def test_conv2d_relay_te(
+        self,
+        data_shape,
+        weight_shape,
+        padding,
+        strides,
+        dtype,
+        conv2d_relay_mod,
+        conv2d_numpy_tensors,
+    ):
+        target = "llvm"
+        with TempOpAttr("nn.conv2d", "FTVMStrategy", _tmp_strategy_te_topi_generic_impl):
+            with tvm.transform.PassContext(
+                opt_level=3,
+            ):
+                lib = relay.build(conv2d_relay_mod, target=target)
+
+        dev = tvm.device(target, 0)
+
+        runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+        runtime.set_input(**conv2d_numpy_tensors)
+        runtime.run()
+
+        out = runtime.get_output(0).numpy()
+
+        ref = get_ref(
+            conv2d_numpy_tensors["data"], conv2d_numpy_tensors["weight"], strides, padding
+        )
+
+        tvm.testing.assert_allclose(out, ref, atol=1e-4, rtol=1e-4)
+
 
 if __name__ == "__main__":
     test_conv2d()

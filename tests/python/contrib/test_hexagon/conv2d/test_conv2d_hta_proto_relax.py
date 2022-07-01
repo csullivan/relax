@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 import numpy as np
+import pytest
+
 import tvm
 import tvm.testing
 from tvm import topi
@@ -133,100 +135,92 @@ def get_ref(data, weight, stride, padding):
     return tvm.topi.testing.conv2d_nchw_python(data, weight, stride, padding)
 
 
-def test_conv2d_relay():
-    N, IC, H, W = 1, 64, 56, 56
-    OC, IC, FH, FW = 128, 64, 3, 3
-    data_shape = (N, IC, H, W)
-    weight_shape = (OC, IC, FH, FW)
-    padding = (0, 0)
-    strides = (1, 1)
-    dtype = "float32"
+class Conv2dBase:
+    FW = tvm.testing.parameter(3)
+    FH = tvm.testing.parameter(3)
+    IC = tvm.testing.parameter(64)
+    OC = tvm.testing.parameter(128)
+    W = tvm.testing.parameter(56)
+    H = tvm.testing.parameter(56)
+    N = tvm.testing.parameter(1)
+    padding = tvm.testing.parameter((0, 0))
+    strides = tvm.testing.parameter((1, 1))
+    dtype = tvm.testing.parameter("float32")
 
-    relay_mod = tvm.IRModule.from_expr(
+
+@pytest.fixture
+def data_shape(N, IC, H, W):
+    return (N, IC, H, W)
+
+
+@pytest.fixture
+def weight_shape(OC, IC, FH, FW):
+    return (OC, IC, FH, FW)
+
+
+@pytest.fixture
+def conv2d_relay_mod(data_shape, weight_shape, padding, strides, dtype):
+    return tvm.IRModule.from_expr(
         get_conv2d(
             data_shape,
             weight_shape,
             dtype,
             padding=padding,
             strides=strides,
-            channels=OC,
-            kernel_size=(FH, FW),
+            channels=weight_shape[0],
+            kernel_size=weight_shape[2:],
             data_layout="NCHW",
             kernel_layout="OIHW",
         )
     )
 
-    data_np = np.random.randn(*data_shape).astype("float32")
-    weight_np = np.random.randn(*weight_shape).astype("float32")
 
-    target = "llvm"
-    params = {"weight": weight_np}
-
-    with TempOpAttr("nn.conv2d", "FTVMStrategy", _tmp_strategy_te_topi_generic_impl):
-        with tvm.transform.PassContext(
-            opt_level=3,
-        ):
-            lib = relay.build(relay_mod, target=target, params=params)
-
-    dev = tvm.device(target, 0)
-
-    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
-
-    runtime.set_input("data", data_np)
-    runtime.run()
-
-    out = runtime.get_output(0).numpy()
-
-    ref = get_ref(data_np, weight_np, strides, padding)
-
-    tvm.testing.assert_allclose(out, ref, atol=1e-4, rtol=1e-4)
+@pytest.fixture
+def conv2d_numpy_tensors(data_shape, weight_shape, dtype):
+    data_np = np.random.randn(*data_shape).astype(dtype)
+    weight_np = np.random.randn(*weight_shape).astype(dtype)
+    return {"data": data_np, "weight": weight_np}
 
 
-def test_conv2d_relax():
-    N, IC, H, W = 1, 64, 56, 56
-    OC, IC, FH, FW = 128, 64, 3, 3
-    data_shape = (N, IC, H, W)
-    weight_shape = (OC, IC, FH, FW)
-    padding = (0, 0)
-    strides = (1, 1)
-    dtype = "float32"
+def conv2d_tir_translator(data_shape, weight_shape, dtype):
+    conv2d_primfunc = compute_tir_conv2d_nchw_oihw(data_shape, weight_shape, dtype)
+    return {"nn.conv2d": conv2d_primfunc}
 
-    relay_mod = tvm.IRModule.from_expr(
-        get_conv2d(
-            data_shape,
-            weight_shape,
-            dtype,
-            padding=padding,
-            strides=strides,
-            channels=OC,
-            kernel_size=(FH, FW),
-            data_layout="NCHW",
-            kernel_layout="OIHW",
+
+class TestConv2d(Conv2dBase):
+    tir_translator = tvm.testing.parameter(None, conv2d_tir_translator)
+
+    def test_conv2d(
+        self,
+        data_shape,
+        weight_shape,
+        padding,
+        strides,
+        dtype,
+        conv2d_relay_mod,
+        conv2d_numpy_tensors,
+        tir_translator,
+    ):
+        target = "llvm"
+        with TempOpAttr("nn.conv2d", "FTVMStrategy", _tmp_strategy_te_topi_generic_impl):
+            op_tir_translation = None
+            if tir_translator:
+                op_tir_translation = tir_translator(data_shape, weight_shape, dtype)
+            relax_mod = relay_translator.from_relay(
+                conv2d_relay_mod["main"], target, translate_op_with_tir=op_tir_translation
+            )
+            print(relax_mod.script())
+            ex = relax.vm.build(relax_mod, target)
+
+        dev = tvm.cpu()
+        runtime = relax.VirtualMachine(ex, dev)
+
+        runtime.set_input("main", **conv2d_numpy_tensors)
+        out = runtime["main"]()
+        ref = get_ref(
+            conv2d_numpy_tensors["data"], conv2d_numpy_tensors["weight"], strides, padding
         )
-    )
-
-    data_np = np.random.randn(*data_shape).astype("float32")
-    weight_np = np.random.randn(*weight_shape).astype("float32")
-
-    target = "llvm"
-
-    with TempOpAttr("nn.conv2d", "FTVMStrategy", _tmp_strategy_te_topi_generic_impl):
-        conv2d_primfunc = compute_tir_conv2d_nchw_oihw(data_shape, weight_shape, dtype)
-        relax_mod = relay_translator.from_relay(
-            relay_mod["main"], target, translate_op_with_tir={"nn.conv2d": conv2d_primfunc}
-        )
-        print(relax_mod.script())
-        ex = relax.vm.build(relax_mod, target)
-
-    dev = tvm.cpu()
-    runtime = relax.VirtualMachine(ex, dev)
-    data = tvm.nd.array(data_np, dev)
-    weight = tvm.nd.array(weight_np, dev)
-    runtime.set_input("main", data, weight)
-    out = runtime["main"]()
-
-    ref = get_ref(data_np, weight_np, strides, padding)
-    tvm.testing.assert_allclose(out.numpy(), ref, atol=1e-4, rtol=1e-4)
+        tvm.testing.assert_allclose(out.numpy(), ref, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
